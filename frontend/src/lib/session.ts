@@ -248,6 +248,9 @@ export class SessionRuntime {
 
       this.reconcile = null;
       this.cursorIndex = this.findNextPendingIndex(0);
+      // Reconciliation is complete. Leave the loading state explicitly before
+      // recalculating readiness; updateStatus intentionally ignores loading.
+      this.status = "ready";
       this.updateStatus();
       this.scheduleConfigSave();
       this.emit();
