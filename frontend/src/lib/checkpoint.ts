@@ -29,14 +29,6 @@ export const SESSION_FILE = "session.json";
 export const MANIFEST_FILE = "manifest.jsonl";
 export const PROGRESS_FILE = "progress.jsonl";
 
-export function checkpointBase(sessionId: string): string {
-  return `${CHECKPOINT_DIR}/${sessionId}`;
-}
-
-export function checkpointPath(sessionId: string, file: string): string {
-  return `${checkpointBase(sessionId)}/${file}`;
-}
-
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -61,6 +53,27 @@ function asNonNegative(value: unknown, field: string): number {
 
 function validSessionId(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/.test(value) && value !== "." && value !== "..";
+}
+
+/**
+ * Checkpoint files live inside the reserved `.adley-labeling` directory. Resolve
+ * that directory to a handle first so the normal path guard (which protects
+ * image destinations from writing into checkpoints) does not reject the
+ * checkpoint writer itself.
+ */
+function checkpointRoot(
+  result: FileSystemDirectoryHandle,
+  create = false,
+): Promise<FileSystemDirectoryHandle> {
+  return result.getDirectoryHandle(CHECKPOINT_DIR, { create });
+}
+
+export function checkpointSessionPath(sessionId: string, file: string): string {
+  if (!validSessionId(sessionId)) throw new Error("Invalid session id.");
+  if (!file || file.includes("/") || file.includes("\\") || file === "." || file === "..") {
+    throw new Error("Invalid checkpoint file name.");
+  }
+  return `${sessionId}/${file}`;
 }
 
 export function parseSessionConfig(raw: unknown): SessionConfig {
@@ -407,7 +420,11 @@ export async function readSessionConfig(
   result: FileSystemDirectoryHandle,
   sessionId: string,
 ): Promise<SessionConfig> {
-  const raw = await readJsonFile<unknown>(result, checkpointPath(sessionId, SESSION_FILE));
+  const root = await checkpointRoot(result);
+  const raw = await readJsonFile<unknown>(
+    root,
+    checkpointSessionPath(sessionId, SESSION_FILE),
+  );
   const config = parseSessionConfig(raw);
   if (config.id !== sessionId) throw new Error("Checkpoint session id does not match its folder.");
   return config;
@@ -433,10 +450,11 @@ export async function readSessionCheckpoint(
   result: FileSystemDirectoryHandle,
   sessionId: string,
 ): Promise<CheckpointSessionData> {
+  const root = await checkpointRoot(result);
   const config = await readSessionConfig(result, sessionId);
   const manifestRaw = await readJsonLines<unknown>(
-    result,
-    checkpointPath(sessionId, MANIFEST_FILE),
+    root,
+    checkpointSessionPath(sessionId, MANIFEST_FILE),
   );
   const manifest = manifestRaw.map(parseManifestImage);
   if (manifest.length !== config.totalImages) {
@@ -451,8 +469,8 @@ export async function readSessionCheckpoint(
   }
 
   const eventsRaw = await readJsonLines<unknown>(
-    result,
-    checkpointPath(sessionId, PROGRESS_FILE),
+    root,
+    checkpointSessionPath(sessionId, PROGRESS_FILE),
   );
   const events: ProgressEvent[] = [];
   for (const raw of eventsRaw) {
@@ -479,14 +497,14 @@ export async function createSessionCheckpoint(
   }
   for (const image of manifest) parseManifestImage(image);
 
-  const base = checkpointBase(config.id);
-  if (await directoryExistsAt(result, base)) {
+  const root = await checkpointRoot(result, true);
+  if (await directoryExistsAt(root, config.id)) {
     throw new Error("A checkpoint with this session id already exists in the result folder.");
   }
 
   let created = false;
   try {
-    const directory = await getDirectoryAt(result, base, true);
+    const directory = await getDirectoryAt(root, config.id, true);
     created = true;
     const handle = await directory.getFileHandle(MANIFEST_FILE, { create: true });
     const writer = await handle.createWritable();
@@ -518,11 +536,11 @@ export async function createSessionCheckpoint(
       throw error;
     }
 
-    await writeJsonFile(result, checkpointPath(config.id, SESSION_FILE), config);
+    await writeJsonFile(root, checkpointSessionPath(config.id, SESSION_FILE), config);
   } catch (error) {
     if (created) {
       try {
-        await removeDirectoryAt(result, base);
+        await removeDirectoryAt(root, config.id);
       } catch {
         // Leave a partial folder behind rather than hiding the original error.
       }
@@ -535,7 +553,8 @@ export async function writeSessionConfig(
   result: FileSystemDirectoryHandle,
   config: SessionConfig,
 ): Promise<void> {
-  await writeJsonFile(result, checkpointPath(config.id, SESSION_FILE), config);
+  const root = await checkpointRoot(result, true);
+  await writeJsonFile(root, checkpointSessionPath(config.id, SESSION_FILE), config);
 }
 
 export type CheckpointWriteState =
@@ -564,9 +583,14 @@ export class CheckpointEventWriter {
     if (this.disposed) return;
     this.pending += 1;
     this.onState({ status: "saving" });
-    const run = this.chain.then(() =>
-      appendJsonLine(this.result, checkpointPath(this.sessionId, PROGRESS_FILE), event),
-    );
+    const run = this.chain.then(async () => {
+      const root = await checkpointRoot(this.result);
+      await appendJsonLine(
+        root,
+        checkpointSessionPath(this.sessionId, PROGRESS_FILE),
+        event,
+      );
+    });
     this.chain = run.then(
       () => undefined,
       () => undefined,

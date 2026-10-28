@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  CheckpointEventWriter,
+  SESSION_FILE,
+  checkpointSessionPath,
   countsFromStates,
+  createSessionCheckpoint,
   decideReconcileAction,
   destinationsInUse,
   parseManifestImage,
   parseSessionConfig,
+  readSessionCheckpoint,
   replayProgressEvents,
   summaryFromCounts,
 } from "./checkpoint";
@@ -363,5 +368,172 @@ describe("checkpoint types", () => {
   it("round-trips a serializable config", () => {
     const parsed: SessionConfig = parseSessionConfig(config());
     expect(JSON.parse(JSON.stringify(parsed))).toEqual(parsed);
+  });
+});
+
+class MemoryFile {
+  readonly kind = "file" as const;
+
+  constructor(
+    readonly name: string,
+    public data: Uint8Array = new Uint8Array(),
+    public lastModified = 0,
+  ) {}
+
+  async getFile(): Promise<File> {
+    const data = this.data;
+    return {
+      name: this.name,
+      size: data.byteLength,
+      lastModified: this.lastModified,
+      slice(start = 0, end = data.byteLength) {
+        const part = data.slice(start, end);
+        return { text: async () => new TextDecoder().decode(part) };
+      },
+      text: async () => new TextDecoder().decode(data),
+    } as unknown as File;
+  }
+
+  async createWritable(options?: { keepExistingData?: boolean }) {
+    return new MemoryWritable(
+      this,
+      options?.keepExistingData === true,
+    ) as unknown as FileSystemWritableFileStream;
+  }
+}
+
+class MemoryWritable {
+  private buffer: Uint8Array;
+  private position = 0;
+
+  constructor(
+    private readonly file: MemoryFile,
+    keepExistingData: boolean,
+  ) {
+    this.buffer = keepExistingData ? file.data.slice() : new Uint8Array();
+  }
+
+  async write(data: string | Uint8Array): Promise<void> {
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    const end = this.position + bytes.byteLength;
+    if (end > this.buffer.byteLength) {
+      const next = new Uint8Array(end);
+      next.set(this.buffer);
+      this.buffer = next;
+    }
+    this.buffer.set(bytes, this.position);
+    this.position = end;
+  }
+
+  async seek(position: number): Promise<void> {
+    this.position = position;
+  }
+
+  async truncate(size: number): Promise<void> {
+    this.buffer = this.buffer.slice(0, size);
+    if (this.position > size) this.position = size;
+  }
+
+  async close(): Promise<void> {
+    this.file.data = this.buffer;
+    this.file.lastModified = Date.now();
+  }
+
+  async abort(): Promise<void> {
+    // The in-memory writer discards uncommitted data on abort.
+  }
+}
+
+class MemoryDirectory {
+  readonly kind = "directory" as const;
+  readonly children = new Map<string, MemoryDirectory | MemoryFile>();
+
+  constructor(readonly name: string) {}
+
+  async getDirectoryHandle(
+    name: string,
+    options: { create?: boolean } = {},
+  ): Promise<MemoryDirectory> {
+    const existing = this.children.get(name);
+    if (existing) {
+      if (existing.kind !== "directory") {
+        throw new DOMException("Not a directory.", "TypeMismatchError");
+      }
+      return existing;
+    }
+    if (!options.create) throw new DOMException("Directory not found.", "NotFoundError");
+    const directory = new MemoryDirectory(name);
+    this.children.set(name, directory);
+    return directory;
+  }
+
+  async getFileHandle(name: string, options: { create?: boolean } = {}): Promise<MemoryFile> {
+    const existing = this.children.get(name);
+    if (existing) {
+      if (existing.kind !== "file") {
+        throw new DOMException("Not a file.", "TypeMismatchError");
+      }
+      return existing;
+    }
+    if (!options.create) throw new DOMException("File not found.", "NotFoundError");
+    const file = new MemoryFile(name);
+    this.children.set(name, file);
+    return file;
+  }
+
+  async removeEntry(name: string): Promise<void> {
+    if (!this.children.delete(name)) {
+      throw new DOMException("Entry not found.", "NotFoundError");
+    }
+  }
+
+  async *values(): AsyncIterableIterator<MemoryDirectory | MemoryFile> {
+    yield* this.children.values();
+  }
+}
+
+function asResultHandle(directory: MemoryDirectory): FileSystemDirectoryHandle {
+  return directory as unknown as FileSystemDirectoryHandle;
+}
+
+describe("checkpoint storage", () => {
+  it("keeps checkpoint paths relative to the reserved checkpoint root", () => {
+    expect(checkpointSessionPath("session-abc", SESSION_FILE)).toBe("session-abc/session.json");
+    expect(() => checkpointSessionPath("../escape", SESSION_FILE)).toThrow();
+    expect(() => checkpointSessionPath("session-abc", "../escape")).toThrow();
+  });
+
+  it("creates, reads, and appends to a checkpoint in the result folder", async () => {
+    const result = new MemoryDirectory("result");
+    const parsed = parseSessionConfig(
+      config({ totalImages: 2, totalBytes: 30 }),
+    );
+    const manifest = [
+      { path: "cats/a.jpg", dir: "cats", name: "a.jpg", size: 10, lastModified: 1 },
+      { path: "dogs/b.jpg", dir: "dogs", name: "b.jpg", size: 20, lastModified: 2 },
+    ];
+
+    await createSessionCheckpoint(asResultHandle(result), parsed, manifest);
+
+    const checkpointDir = await result.getDirectoryHandle(".adley-labeling");
+    expect(checkpointDir.children.has(parsed.id)).toBe(true);
+
+    const loaded = await readSessionCheckpoint(asResultHandle(result), parsed.id);
+    expect(loaded.config.id).toBe(parsed.id);
+    expect(loaded.manifest).toEqual(manifest);
+    expect(loaded.events).toEqual([]);
+
+    const states: string[] = [];
+    const writer = new CheckpointEventWriter(
+      asResultHandle(result),
+      parsed.id,
+      (state) => states.push(state.status),
+    );
+    writer.append(label(1, "cats/a.jpg"));
+    await writer.flush();
+
+    const updated = await readSessionCheckpoint(asResultHandle(result), parsed.id);
+    expect(updated.events).toHaveLength(1);
+    expect(states).toContain("saved");
   });
 });
