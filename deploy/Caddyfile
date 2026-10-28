@@ -1,0 +1,30 @@
+{
+	email {$ACME_EMAIL}
+	# Uncomment for staging while testing DNS/TLS:
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+{$ADLEY_DOMAIN} {
+	encode zstd gzip
+
+	@immutable_assets path /assets/*
+	header @immutable_assets Cache-Control "public, max-age=31536000, immutable"
+
+	header {
+		-Server
+	}
+
+	# Caddy is the only public entry point. Replace any incoming forwarding
+	# headers so clients cannot spoof their IP through X-Forwarded-For.
+	reverse_proxy app:8000 {
+		header_up Host {http.request.host}
+		header_up X-Forwarded-For {http.request.remote.host}
+		header_up X-Forwarded-Proto {http.request.scheme}
+		header_up X-Real-IP {http.request.remote.host}
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

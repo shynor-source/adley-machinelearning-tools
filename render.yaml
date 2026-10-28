@@ -1,0 +1,45 @@
+# Render Blueprint for Adley Machine Learning Tools.
+#
+# Render builds the multi-stage Dockerfile, serves the app over HTTPS at
+# https://<name>.onrender.com, and injects PORT (10000 by default). No database,
+# disk, or paid add-on is required: the app is stateless and images stay in the
+# browser.
+#
+# Deploy: Render Dashboard -> New -> Blueprint -> connect the repository that
+# contains this file -> Apply. See README section 2 for the full walkthrough.
+
+services:
+  - type: web
+    name: adley-ml-tools
+    runtime: docker
+    plan: free
+    # Change before the first deploy if you want a region closer to your team:
+    # oregon, ohio, virginia, frankfurt, or singapore.
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: ADLEY_COOKIE_SECURE
+        value: "true"
+      # Public Render web services sit behind Cloudflare, which overwrites
+      # CF-Connecting-IP with the real client address. Prefer that header:
+      # Cloudflare merely appends to X-Forwarded-For, so its leftmost value can
+      # be supplied by the caller.
+      - key: ADLEY_TRUST_CLOUDFLARE
+        value: "true"
+      - key: ADLEY_TRUST_PROXY
+        value: "false"
+      # Render generates a unique 256-bit value and keeps it across deploys.
+      # The app refuses to start without a strong secret.
+      - key: ADLEY_SESSION_SECRET
+        generateValue: true
+      # No account or password is stored in this repository. Render prompts
+      # for these values when the Blueprint is created. Use your own username
+      # and a hash generated locally with:
+      #   python3 scripts/hash_password.py
+      - key: ADLEY_USERNAME
+        sync: false
+      - key: ADLEY_PASSWORD_HASH
+        sync: false

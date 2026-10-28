@@ -1,0 +1,28 @@
+# Dependencies and builds
+frontend/node_modules/
+frontend/dist/
+backend/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.ssh/
+
+# Tooling and OS noise
+.vscode/
+.idea/
+.DS_Store
+*.log
+npm-debug.log*

@@ -1,0 +1,65 @@
+# Optional self-hosted VPS stack (Caddy + app).
+# Render does not use this file; it builds the Dockerfile directly from
+# render.yaml. See README section 3 for the VPS walkthrough.
+name: adley-machine-learning-tools
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # The app is only reachable on the internal Docker network.
+      ADLEY_STATIC_DIR: /app/frontend/dist
+      ADLEY_TRUST_PROXY: "true"
+      # Keep the container port aligned with the healthcheck below, even if a
+      # stray PORT value exists in .env.
+      PORT: "8000"
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      ADLEY_DOMAIN: ${ADLEY_DOMAIN:?Set ADLEY_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  caddy_data:
+  caddy_config:
