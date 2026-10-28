@@ -33,8 +33,6 @@ import {
 } from "../lib/checkpoint";
 import {
   ensurePermission,
-  getFileAt,
-  isNotFound,
   pickDirectory,
 } from "../lib/fs";
 import {
@@ -43,17 +41,9 @@ import {
   formatDate,
   formatNumber,
 } from "../lib/path";
+import { SAMPLE_CHECK_COUNT, checkSourceSample, type SourceCheck } from "../lib/resume";
 import { SessionRuntime } from "../lib/session";
 import type { CheckpointSessionData, SessionConfig } from "../lib/types";
-
-const SAMPLE_CHECK_COUNT = 5;
-
-interface SourceCheck {
-  status: "idle" | "checking" | "ok" | "warning";
-  missing: string[];
-  checked: number;
-  error?: string;
-}
 
 function progressValues(config: SessionConfig): { handled: number; percent: number } {
   const summary = config.summary;
@@ -64,39 +54,6 @@ function progressValues(config: SessionConfig): { handled: number; percent: numb
   );
   const percent = config.totalImages > 0 ? (handled / config.totalImages) * 100 : 0;
   return { handled, percent };
-}
-
-/**
- * Verifies a small sample of manifest paths. A full verification would read
- * the whole manifest and every directory up front; copies still validate each
- * source file, and the checkpoint reconciler handles later mismatches.
- */
-async function checkSourceSample(
-  source: FileSystemDirectoryHandle,
-  checkpoint: CheckpointSessionData,
-): Promise<SourceCheck> {
-  const sample = checkpoint.manifest.slice(0, SAMPLE_CHECK_COUNT);
-  const missing: string[] = [];
-  for (const image of sample) {
-    try {
-      const handle = await getFileAt(source, image.path);
-      await handle.getFile();
-    } catch (error) {
-      if (isNotFound(error)) missing.push(image.path);
-      else {
-        return {
-          status: "warning",
-          missing,
-          checked: sample.length,
-          error: errorMessage(error),
-        };
-      }
-    }
-  }
-  if (missing.length > 0) {
-    return { status: "warning", missing, checked: sample.length };
-  }
-  return { status: "ok", missing: [], checked: sample.length };
 }
 
 function SessionCard({

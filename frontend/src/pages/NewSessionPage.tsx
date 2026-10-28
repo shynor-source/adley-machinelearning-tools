@@ -9,6 +9,7 @@ import {
   Info,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
   ShieldCheck,
   Tags,
@@ -27,6 +28,8 @@ import {
 import { useSession } from "../context/SessionContext";
 import {
   createSessionCheckpoint,
+  listStoredSessions,
+  readSessionCheckpoint,
   type CreateCheckpointProgress,
 } from "../lib/checkpoint";
 import {
@@ -40,11 +43,13 @@ import {
   buildDestinationPreview,
   errorMessage,
   formatBytes,
+  formatDate,
   formatNumber,
   sanitizeFolderName,
   validateClassNames,
   type OutputMode,
 } from "../lib/path";
+import { checkSourceSample } from "../lib/resume";
 import { SessionRuntime } from "../lib/session";
 import type { ScanProgress, ScanResult, SessionConfig } from "../lib/types";
 import { classColor } from "../lib/class-colors";
@@ -140,7 +145,12 @@ export function NewSessionPage() {
   const [createStage, setCreateStage] = useState("");
   const [createProgress, setCreateProgress] = useState<CreateCheckpointProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [existingSessions, setExistingSessions] = useState<SessionConfig[] | null>(null);
+  const [checkingExisting, setCheckingExisting] = useState(false);
+  const [startNewAnyway, setStartNewAnyway] = useState(false);
+  const [resumingExisting, setResumingExisting] = useState(false);
   const scanAbort = useRef<AbortController | null>(null);
+  const inspectRequest = useRef(0);
 
   useEffect(() => {
     return () => scanAbort.current?.abort();
@@ -157,6 +167,14 @@ export function NewSessionPage() {
   }, [scan, mode, hasClassErrors, classFolders.join("|")]);
 
   const validationError = validation?.error ?? null;
+  const latestExisting = existingSessions?.[0] ?? null;
+  const existingCount = existingSessions?.length ?? 0;
+  const latestHandled = latestExisting?.summary
+    ? Math.min(
+        latestExisting.totalImages,
+        latestExisting.summary.labeled + latestExisting.summary.skipped,
+      )
+    : 0;
   const canScan = Boolean(
     source &&
       result &&
@@ -172,12 +190,28 @@ export function NewSessionPage() {
     if (!source) return "Choose a source folder.";
     if (!result) return "Choose a result folder.";
     if (checkingFolders) return "Checking the selected folders…";
+    if (checkingExisting) return "Checking the result folder for existing checkpoints…";
     if (validationError) return validationError;
     if (!validation) return "The folder selection could not be verified.";
+    if (existingCount > 0 && !startNewAnyway) {
+      return "This result folder already contains a checkpoint. Resume it below, or confirm that you want to start a new session.";
+    }
     if (!scan) return "Scan the source folder.";
     if (scan.images.length === 0) return "No supported images were found.";
     return null;
-  }, [name, hasClassErrors, source, result, checkingFolders, validationError, validation, scan]);
+  }, [
+    name,
+    hasClassErrors,
+    source,
+    result,
+    checkingFolders,
+    checkingExisting,
+    validationError,
+    validation,
+    existingCount,
+    startNewAnyway,
+    scan,
+  ]);
 
   const canStart = !missingReason && !creating && !scanning;
 
@@ -190,15 +224,39 @@ export function NewSessionPage() {
     setScanError(null);
   }
 
+  async function inspectResult(handle: FileSystemDirectoryHandle | null) {
+    const requestId = ++inspectRequest.current;
+    setStartNewAnyway(false);
+    setExistingSessions(null);
+    if (!handle) {
+      setCheckingExisting(false);
+      return;
+    }
+    setCheckingExisting(true);
+    try {
+      const sessions = await listStoredSessions(handle);
+      if (inspectRequest.current !== requestId) return;
+      setExistingSessions(sessions);
+    } catch (reason) {
+      if (inspectRequest.current !== requestId) return;
+      setExistingSessions([]);
+      setError(`Could not check this result folder for existing sessions: ${errorMessage(reason)}`);
+    } finally {
+      if (inspectRequest.current === requestId) setCheckingExisting(false);
+    }
+  }
+
   async function applyFolders(
     nextSource: FileSystemDirectoryHandle | null,
     nextResult: FileSystemDirectoryHandle | null,
+    checkForExisting = false,
   ) {
     setSource(nextSource);
     setResult(nextResult);
     resetScan();
     setValidation(null);
     setError(null);
+    if (checkForExisting) void inspectResult(nextResult);
     if (!nextSource || !nextResult) return;
     setCheckingFolders(true);
     try {
@@ -228,7 +286,7 @@ export function NewSessionPage() {
     try {
       const picked = await pickDirectory("adley-labeling-result", "readwrite");
       if (!picked) return;
-      await applyFolders(source, picked);
+      await applyFolders(source, picked, true);
     } catch (reason) {
       setError(errorMessage(reason));
     }
@@ -276,6 +334,34 @@ export function NewSessionPage() {
   function removeClass(id: string) {
     if (classes.length <= 1) return;
     setClasses((current) => current.filter((item) => item.id !== id));
+  }
+
+  async function resumeExisting(session: SessionConfig) {
+    if (!source || !result || resumingExisting) return;
+    setResumingExisting(true);
+    setError(null);
+    try {
+      const granted = await ensurePermission(result, "readwrite");
+      if (!granted) {
+        throw new DOMException("Result folder permission was not granted.", "NotAllowedError");
+      }
+      const checkpoint = await readSessionCheckpoint(result, session.id);
+      const sourceCheck = await checkSourceSample(source, checkpoint);
+      if (
+        sourceCheck.error ||
+        (sourceCheck.checked > 0 && sourceCheck.missing.length === sourceCheck.checked)
+      ) {
+        throw new Error(
+          "The selected source folder does not match this checkpoint. Choose the original source folder and try again.",
+        );
+      }
+      const runtime = SessionRuntime.fromCheckpoint(source, result, checkpoint);
+      await startSession(runtime);
+      navigate("/labeling/workspace");
+    } catch (reason) {
+      setError(errorMessage(reason));
+      setResumingExisting(false);
+    }
   }
 
   async function handleStart() {
@@ -611,6 +697,104 @@ export function NewSessionPage() {
                 <NoticeBanner tone="amber" title="Result folder is inside the source folder">
                   {validation.warning}
                 </NoticeBanner>
+              </div>
+            ) : null}
+
+            {checkingExisting ? (
+              <p className="mt-3 flex items-center gap-2 text-xs text-slate-500">
+                <Spinner className="h-3.5 w-3.5" />
+                Checking this result folder for existing checkpoints…
+              </p>
+            ) : null}
+
+            {latestExisting ? (
+              <div className="mt-4 rounded-xl border border-amber-400/20 bg-amber-400/[0.06] p-4">
+                <div className="flex items-start gap-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-amber-400/20 bg-amber-400/10 text-amber-200">
+                    <RotateCcw className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold text-white">
+                      {existingCount === 1
+                        ? "Existing checkpoint found"
+                        : `${formatNumber(existingCount)} existing checkpoints found`}
+                    </p>
+                    <p className="mt-1 text-xs leading-5 text-slate-400">
+                      This result folder already contains labeling work. Resume the most recent
+                      session instead of starting over. Starting a new session will not change the
+                      existing checkpoint.
+                    </p>
+                    <div className="mt-3 rounded-lg border border-white/[0.06] bg-ink-950/35 p-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="truncate text-sm font-medium text-white">
+                          {latestExisting.name}
+                        </p>
+                        <span className="text-[10px] uppercase tracking-wider text-slate-600">
+                          {formatDate(latestExisting.createdAt)}
+                        </span>
+                      </div>
+                      <p className="mt-1 truncate text-[11px] text-slate-500">
+                        {latestExisting.sourceName} → {latestExisting.resultName} ·{" "}
+                        {formatNumber(latestExisting.totalImages)} images
+                      </p>
+                      <div className="mt-2">
+                        <div className="mb-1 flex items-center justify-between text-[10px] text-slate-600">
+                          <span>{formatNumber(latestHandled)} handled</span>
+                          <span>
+                            {latestExisting.totalImages > 0
+                              ? `${((latestHandled / latestExisting.totalImages) * 100).toFixed(0)}%`
+                              : "0%"}
+                          </span>
+                        </div>
+                        <ProgressBar
+                          value={latestHandled}
+                          total={latestExisting.totalImages}
+                        />
+                      </div>
+                    </div>
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <Button
+                        size="sm"
+                        onClick={() => void resumeExisting(latestExisting)}
+                        disabled={!source || resumingExisting}
+                        loading={resumingExisting}
+                      >
+                        <RotateCcw className="h-3.5 w-3.5" />
+                        Resume latest session
+                      </Button>
+                      {startNewAnyway ? (
+                        <button
+                          type="button"
+                          onClick={() => setStartNewAnyway(false)}
+                          className="text-xs font-medium text-amber-200 underline decoration-amber-300/30 underline-offset-4 transition hover:text-amber-100"
+                        >
+                          Resume instead
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setStartNewAnyway(true)}
+                          className="text-xs font-medium text-slate-400 underline decoration-white/15 underline-offset-4 transition hover:text-slate-200"
+                        >
+                          Start a new session anyway
+                        </button>
+                      )}
+                    </div>
+                    {!source ? (
+                      <p className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500">
+                        <Info className="h-3 w-3 shrink-0" />
+                        Choose the original source folder above, then resume. A source mismatch is
+                        rejected before any copy starts.
+                      </p>
+                    ) : null}
+                    {startNewAnyway ? (
+                      <p className="mt-2 flex items-center gap-1.5 text-[11px] text-amber-200/80">
+                        <Info className="h-3 w-3 shrink-0" />
+                        New-session mode is enabled. The existing checkpoint will be left untouched.
+                      </p>
+                    ) : null}
+                  </div>
+                </div>
               </div>
             ) : null}
 

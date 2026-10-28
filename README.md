@@ -444,6 +444,7 @@ The backend tests expect the virtual environment created above.
    - Add 1–20 classes. Class names must be unique; unsafe filesystem characters are replaced automatically.
    - Choose a **source folder** (read-only) containing images.
    - Choose a **result folder** (read + write) for labeled copies and checkpoints.
+   - If the result folder already contains `.adley-labeling` checkpoints, the app shows the most recent session and offers **Resume latest session**. Starting a new session is blocked until you explicitly choose **Start a new session anyway**, so existing work is not hidden or overwritten.
    - Choose **Flat by class** (default) or **Preserve source folder structure (Full mirror)**.
    - Run the recursive scan and review the destination preview.
 2. **Label.**
